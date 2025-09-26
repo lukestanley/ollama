@@ -175,6 +175,9 @@ func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, a
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
 	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
+	if numParallel > 1 {
+		loadRequest.MultiUserCache = true
+	}
 
 	defaultThreads := discover.GetSystemInfo().GetOptimalThreadCount()
 	if opts.NumThread > 0 {

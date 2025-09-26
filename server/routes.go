@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -113,7 +114,7 @@ func modelOptions(model *Model, requestOpts map[string]any) (api.Options, error)
 
 // scheduleRunner schedules a runner after validating inputs such as capabilities and model options.
 // It returns the allocated runner, model instance, and consolidated options if successful and error otherwise.
-func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration) (llm.LlamaServer, *Model, *api.Options, error) {
+func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, samples int) (llm.LlamaServer, *Model, *api.Options, error) {
 	if name == "" {
 		return nil, nil, nil, fmt.Errorf("model %w", errRequired)
 	}
@@ -136,13 +137,28 @@ func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.C
 		return nil, nil, nil, err
 	}
 
+	baseThreads := opts.Runner.NumThread
+	if baseThreads <= 0 {
+		baseThreads = discover.GetSystemInfo().GetOptimalThreadCount()
+	}
+	if baseThreads > 0 {
+		threadsPerSample := baseThreads
+		if samples > 1 {
+			threadsPerSample = int(math.Ceil(float64(baseThreads) / float64(samples)))
+			if threadsPerSample > baseThreads {
+				threadsPerSample = baseThreads
+			}
+		}
+		opts.Runner.NumThread = threadsPerSample
+	}
+
 	// This model is much more capable with a larger context, so set that
 	// unless it would penalize performance too much
 	if !s.lowVRAM && slices.Contains([]string{"gptoss", "gpt-oss"}, model.Config.ModelFamily) {
 		opts.NumCtx = max(opts.NumCtx, 8192)
 	}
 
-	runnerCh, errCh := s.sched.GetRunner(ctx, model, opts, keepAlive)
+	runnerCh, errCh := s.sched.GetRunner(ctx, model, opts, keepAlive, samples)
 	var runner *runnerRef
 	select {
 	case runner = <-runnerCh:
@@ -338,7 +354,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// updated template supporting thinking
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive, 1)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support generate", req.Model)})
 		return
@@ -613,7 +629,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive)
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive, 1)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return
@@ -738,7 +754,7 @@ func (s *Server) EmbeddingsHandler(c *gin.Context) {
 		return
 	}
 
-	r, _, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive)
+	r, _, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []model.Capability{}, req.Options, req.KeepAlive, 1)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return
@@ -1867,6 +1883,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	samples := req.Samples
+	if samples <= 0 {
+		samples = 1
+	}
+
 	caps := []model.Capability{model.CapabilityCompletion}
 	if len(req.Tools) > 0 {
 		caps = append(caps, model.CapabilityTools)
@@ -1875,7 +1896,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		caps = append(caps, model.CapabilityThinking)
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive, samples)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
 		return
@@ -1907,19 +1928,20 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		m.Config.Parser = "harmony"
 	}
 
-	var builtinParser parsers.Parser
 	processedTools := req.Tools
+	var parserName string
+	var parserSupportsTools bool
+	var lastMessage *api.Message
+
+	if len(msgs) > 0 {
+		lastMessage = &msgs[len(msgs)-1]
+	}
 
 	if m.Config.Parser != "" {
-		builtinParser = parsers.ParserForName(m.Config.Parser)
-		if builtinParser != nil {
-			// Determine last message for chat prefill
-			var lastMessage *api.Message
-			if len(msgs) > 0 {
-				lastMessage = &msgs[len(msgs)-1]
-			}
-			// Initialize parser and get processed tools
-			processedTools = builtinParser.Init(req.Tools, lastMessage)
+		if p := parsers.ParserForName(m.Config.Parser); p != nil {
+			parserName = m.Config.Parser
+			parserSupportsTools = p.HasToolSupport()
+			processedTools = p.Init(req.Tools, lastMessage)
 		}
 	}
 
@@ -1949,122 +1971,167 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
-	var thinkingState *thinking.Parser
 	openingTag, closingTag := thinking.InferTags(m.Template.Template)
-	if req.Think != nil && req.Think.Bool() && openingTag != "" && closingTag != "" {
-		thinkingState = &thinking.Parser{
-			OpeningTag: openingTag,
-			ClosingTag: closingTag,
-		}
-
-		if strings.HasSuffix(strings.TrimSpace(prompt), openingTag) {
-			thinkingState.AddContent(openingTag)
-		}
-	}
-
-	var toolParser *tools.Parser
-	if len(req.Tools) > 0 && (builtinParser == nil || !builtinParser.HasToolSupport()) {
-		toolParser = tools.NewParser(m.Template.Template, req.Tools)
-	}
 
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
 
-		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
-			Prompt:  prompt,
-			Images:  images,
-			Format:  req.Format,
-			Options: opts,
-		}, func(r llm.CompletionResponse) {
-			res := api.ChatResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now().UTC(),
-				Message:   api.Message{Role: "assistant", Content: r.Content},
-				Done:      r.Done,
-				Metrics: api.Metrics{
-					PromptEvalCount:    r.PromptEvalCount,
-					PromptEvalDuration: r.PromptEvalDuration,
-					EvalCount:          r.EvalCount,
-					EvalDuration:       r.EvalDuration,
-				},
-			}
-			if r.Done {
-				res.DoneReason = r.DoneReason.String()
-				res.TotalDuration = time.Since(checkpointStart)
-				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-			}
+		ctx := c.Request.Context()
+		var wg sync.WaitGroup
+		errCh := make(chan error, samples)
 
-			if builtinParser != nil {
-				slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser input", "parser", m.Config.Parser, "content", r.Content)
+		for i := 0; i < samples; i++ {
+			idx := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 
-				content, thinking, toolCalls, err := builtinParser.Add(r.Content, r.Done)
-				if err != nil {
-					ch <- gin.H{"error": err.Error()}
-					return
-				}
-
-				res.Message.Content = content
-				res.Message.Thinking = thinking
-				res.Message.ToolCalls = toolCalls
-
-				if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done {
-					slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser output", "parser", m.Config.Parser, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
-					ch <- res
-				} else {
-					slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser empty output", "parser", m.Config.Parser)
-				}
-
-				return
-			}
-
-			if thinkingState != nil {
-				thinkingContent, remainingContent := thinkingState.AddContent(res.Message.Content)
-				if thinkingContent == "" && remainingContent == "" && !r.Done {
-					// need to accumulate more to decide what to send
-					return
-				}
-				res.Message.Content = remainingContent
-				res.Message.Thinking = thinkingContent
-			}
-
-			if len(req.Tools) > 0 {
-				toolCalls, content := toolParser.Add(res.Message.Content)
-				if len(content) > 0 {
-					res.Message.Content = content
-				} else if len(toolCalls) > 0 {
-					res.Message.ToolCalls = toolCalls
-					res.Message.Content = ""
-				} else if res.Message.Thinking != "" {
-					// don't return
-				} else {
-					if r.Done {
-						res.Message.Content = toolParser.Content()
-						ch <- res
+				sampleCtx := ctx
+				var sampleParser parsers.Parser
+				if parserName != "" {
+					sampleParser = parsers.ParserForName(parserName)
+					if sampleParser != nil {
+						sampleParser.Init(req.Tools, lastMessage)
 					}
-					return
 				}
-			}
 
-			ch <- res
-		}); err != nil {
+				var thinkingState *thinking.Parser
+				if req.Think != nil && req.Think.Bool() && openingTag != "" && closingTag != "" {
+					thinkingState = &thinking.Parser{
+						OpeningTag: openingTag,
+						ClosingTag: closingTag,
+					}
+
+					if strings.HasSuffix(strings.TrimSpace(prompt), openingTag) {
+						thinkingState.AddContent(openingTag)
+					}
+				}
+
+				var toolParser *tools.Parser
+				if len(req.Tools) > 0 && (!parserSupportsTools || sampleParser == nil) {
+					toolParser = tools.NewParser(m.Template.Template, req.Tools)
+				}
+
+				err := r.Completion(sampleCtx, llm.CompletionRequest{
+					Prompt:  prompt,
+					Images:  images,
+					Format:  req.Format,
+					Options: opts,
+				}, func(resp llm.CompletionResponse) {
+					res := api.ChatResponse{
+						Model:     req.Model,
+						CreatedAt: time.Now().UTC(),
+						Message:   api.Message{Role: "assistant", Content: resp.Content},
+						Done:      resp.Done,
+						Metrics: api.Metrics{
+							PromptEvalCount:    resp.PromptEvalCount,
+							PromptEvalDuration: resp.PromptEvalDuration,
+							EvalCount:          resp.EvalCount,
+							EvalDuration:       resp.EvalDuration,
+						},
+						Index: idx,
+					}
+					if resp.Done {
+						res.DoneReason = resp.DoneReason.String()
+						res.TotalDuration = time.Since(checkpointStart)
+						res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+					}
+
+					if sampleParser != nil {
+						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser input", "parser", parserName, "content", resp.Content)
+
+						content, thinking, toolCalls, err := sampleParser.Add(resp.Content, resp.Done)
+						if err != nil {
+							errCh <- err
+							return
+						}
+
+						res.Message.Content = content
+						res.Message.Thinking = thinking
+						res.Message.ToolCalls = toolCalls
+
+						if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || resp.Done {
+							slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser output", "parser", parserName, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", resp.Done)
+							ch <- res
+						} else {
+							slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser empty output", "parser", parserName)
+						}
+
+						return
+					}
+
+					if thinkingState != nil {
+						thinkingContent, remainingContent := thinkingState.AddContent(res.Message.Content)
+						if thinkingContent == "" && remainingContent == "" && !resp.Done {
+							// need to accumulate more to decide what to send
+							return
+						}
+						res.Message.Content = remainingContent
+						res.Message.Thinking = thinkingContent
+					}
+
+					if toolParser != nil {
+						toolCalls, content := toolParser.Add(res.Message.Content)
+						if len(content) > 0 {
+							res.Message.Content = content
+						} else if len(toolCalls) > 0 {
+							res.Message.ToolCalls = toolCalls
+							res.Message.Content = ""
+						} else if res.Message.Thinking != "" {
+							// don't return
+						} else {
+							if resp.Done {
+								res.Message.Content = toolParser.Content()
+								ch <- res
+							}
+							return
+						}
+					}
+
+					ch <- res
+				})
+				if err != nil {
+					errCh <- err
+				}
+			}()
+		}
+
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			if err == nil {
+				continue
+			}
 			ch <- gin.H{"error": err.Error()}
 		}
 	}()
 
 	if req.Stream != nil && !*req.Stream {
-		var resp api.ChatResponse
-		var toolCalls []api.ToolCall
-		var sbThinking strings.Builder
-		var sbContent strings.Builder
+		type sampleAccumulator struct {
+			response  api.ChatResponse
+			thinking  strings.Builder
+			content   strings.Builder
+			toolCalls []api.ToolCall
+		}
+
+		responses := make(map[int]*sampleAccumulator)
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
-				sbThinking.WriteString(t.Message.Thinking)
-				sbContent.WriteString(t.Message.Content)
-				resp = t
-				if len(req.Tools) > 0 {
-					toolCalls = append(toolCalls, t.Message.ToolCalls...)
+				acc, ok := responses[t.Index]
+				if !ok {
+					acc = &sampleAccumulator{response: t}
+					responses[t.Index] = acc
+				} else {
+					acc.response = t
+				}
+
+				acc.thinking.WriteString(t.Message.Thinking)
+				acc.content.WriteString(t.Message.Content)
+				if len(req.Tools) > 0 && len(t.Message.ToolCalls) > 0 {
+					acc.toolCalls = append(acc.toolCalls, t.Message.ToolCalls...)
 				}
 			case gin.H:
 				msg, ok := t["error"].(string)
@@ -2080,14 +2147,33 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 		}
 
-		resp.Message.Content = sbContent.String()
-		resp.Message.Thinking = sbThinking.String()
-
-		if len(toolCalls) > 0 {
-			resp.Message.ToolCalls = toolCalls
+		if len(responses) == 0 {
+			c.JSON(http.StatusOK, api.MultiChatResponse{Responses: []api.ChatResponse{}})
+			return
 		}
 
-		c.JSON(http.StatusOK, resp)
+		indexes := make([]int, 0, len(responses))
+		for idx := range responses {
+			indexes = append(indexes, idx)
+		}
+		slices.Sort(indexes)
+
+		aggregated := make([]api.ChatResponse, 0, len(indexes))
+		for _, idx := range indexes {
+			acc := responses[idx]
+			acc.response.Message.Content = acc.content.String()
+			acc.response.Message.Thinking = acc.thinking.String()
+			if len(acc.toolCalls) > 0 {
+				acc.response.Message.ToolCalls = acc.toolCalls
+			}
+			aggregated = append(aggregated, acc.response)
+		}
+
+		if len(aggregated) == 1 {
+			c.JSON(http.StatusOK, aggregated[0])
+		} else {
+			c.JSON(http.StatusOK, api.MultiChatResponse{Responses: aggregated})
+		}
 		return
 	}
 

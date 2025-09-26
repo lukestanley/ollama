@@ -556,7 +556,12 @@ func TestChatMiddleware(t *testing.T) {
 				}
 				return
 			}
-			if diff := cmp.Diff(&tc.req, capturedRequest); diff != "" {
+			expected := tc.req
+			if expected.Samples == 0 {
+				expected.Samples = 1
+			}
+
+			if diff := cmp.Diff(&expected, capturedRequest); diff != "" {
 				t.Fatalf("requests did not match: %+v", diff)
 			}
 			if diff := cmp.Diff(tc.err, errResp); diff != "" {

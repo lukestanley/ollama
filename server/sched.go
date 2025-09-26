@@ -29,6 +29,7 @@ type LlmRequest struct {
 	model           *Model
 	opts            api.Options
 	sessionDuration *api.Duration
+	samples         int
 	successCh       chan *runnerRef
 	errCh           chan error
 	schedAttempts   uint
@@ -82,7 +83,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
 }
 
 // context must be canceled to decrement ref count and release the runner
-func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration) (chan *runnerRef, chan error) {
+func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, samples int) (chan *runnerRef, chan error) {
 	if opts.NumCtx < 4 {
 		opts.NumCtx = 4
 	}
@@ -92,11 +93,16 @@ func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, ses
 		opts.NumCtx = max(opts.NumCtx, 2048)
 	}
 
+	if samples <= 0 {
+		samples = 1
+	}
+
 	req := &LlmRequest{
 		ctx:             c,
 		model:           m,
 		opts:            opts,
 		sessionDuration: sessionDuration,
+		samples:         samples,
 		successCh:       make(chan *runnerRef, 1),
 		errCh:           make(chan error, 1),
 	}
@@ -382,7 +388,8 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, f *ggml.GGML, gpus discover.GpuInfoList, requireFull bool) bool {
-	numParallel := max(int(envconfig.NumParallel()), 1)
+	requestedParallel := max(req.samples, 1)
+	numParallel := max(int(envconfig.NumParallel()), requestedParallel)
 
 	// Embedding models should always be loaded with parallel=1
 	if req.model.CheckCapabilities(model.CapabilityCompletion) != nil {
@@ -587,6 +594,11 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	}
 
 	if runner.Options == nil {
+		return true
+	}
+
+	if req.samples > runner.numParallel {
+		slog.Debug("runner parallelism insufficient, reloading", "current", runner.numParallel, "requested", req.samples)
 		return true
 	}
 
