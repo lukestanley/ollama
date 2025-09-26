@@ -119,6 +119,9 @@ type ChatRequest struct {
 	// Messages is the messages of the chat - can be used to keep a chat memory.
 	Messages []Message `json:"messages"`
 
+	// Samples controls how many responses should be generated in parallel.
+	Samples int `json:"samples,omitempty"`
+
 	// Stream enables streaming of returned responses; true by default.
 	Stream *bool `json:"stream,omitempty"`
 
@@ -352,6 +355,14 @@ type ChatResponse struct {
 	DebugInfo *DebugInfo `json:"_debug_info,omitempty"`
 
 	Metrics
+
+	// Index identifies the sample this response belongs to when multiple samples are generated.
+	Index int `json:"index,omitempty"`
+}
+
+// MultiChatResponse contains multiple chat responses for requests that sample several completions.
+type MultiChatResponse struct {
+	Responses []ChatResponse `json:"responses"`
 }
 
 // DebugInfo contains debug information for template rendering

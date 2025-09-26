@@ -94,6 +94,7 @@ type ChatCompletionRequest struct {
 	Messages         []Message       `json:"messages"`
 	Stream           bool            `json:"stream"`
 	StreamOptions    *StreamOptions  `json:"stream_options"`
+	N                int             `json:"n,omitempty"`
 	MaxTokens        *int            `json:"max_tokens"`
 	Seed             *int            `json:"seed"`
 	Stop             any             `json:"stop"`
@@ -220,12 +221,21 @@ func NewError(code int, message string) ErrorResponse {
 	return ErrorResponse{Error{Type: etype, Message: message}}
 }
 
-func toUsage(r api.ChatResponse) Usage {
-	return Usage{
-		PromptTokens:     r.PromptEvalCount,
-		CompletionTokens: r.EvalCount,
-		TotalTokens:      r.PromptEvalCount + r.EvalCount,
+func toUsage(responses []api.ChatResponse) Usage {
+	if len(responses) == 0 {
+		return Usage{}
 	}
+
+	usage := Usage{
+		PromptTokens: responses[0].Metrics.PromptEvalCount,
+	}
+
+	for _, r := range responses {
+		usage.CompletionTokens += r.Metrics.EvalCount
+	}
+
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	return usage
 }
 
 func toolCallId() string {
@@ -256,28 +266,47 @@ func toToolCalls(tc []api.ToolCall) []ToolCall {
 	return toolCalls
 }
 
-func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
-	toolCalls := toToolCalls(r.Message.ToolCalls)
-	return ChatCompletion{
-		Id:                id,
-		Object:            "chat.completion",
-		Created:           r.CreatedAt.Unix(),
-		Model:             r.Model,
-		SystemFingerprint: "fp_ollama",
-		Choices: []Choice{{
-			Index:   0,
-			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+func toChatCompletion(id string, responses []api.ChatResponse) ChatCompletion {
+	if len(responses) == 0 {
+		return ChatCompletion{Id: id, Object: "chat.completion", SystemFingerprint: "fp_ollama"}
+	}
+
+	choices := make([]Choice, 0, len(responses))
+	for _, r := range responses {
+		toolCalls := toToolCalls(r.Message.ToolCalls)
+		idx := r.Index
+		choice := Choice{
+			Index: idx,
+			Message: Message{
+				Role:      r.Message.Role,
+				Content:   r.Message.Content,
+				ToolCalls: toolCalls,
+				Reasoning: r.Message.Thinking,
+			},
 			FinishReason: func(reason string) *string {
 				if len(toolCalls) > 0 {
-					reason = "tool_calls"
+					reason = finishReasonToolCalls
 				}
 				if len(reason) > 0 {
 					return &reason
 				}
 				return nil
 			}(r.DoneReason),
-		}}, Usage: toUsage(r),
-		DebugInfo: r.DebugInfo,
+		}
+		choices = append(choices, choice)
+	}
+
+	usage := toUsage(responses)
+
+	return ChatCompletion{
+		Id:                id,
+		Object:            "chat.completion",
+		Created:           responses[0].CreatedAt.Unix(),
+		Model:             responses[0].Model,
+		SystemFingerprint: "fp_ollama",
+		Choices:           choices,
+		Usage:             usage,
+		DebugInfo:         responses[0].DebugInfo,
 	}
 }
 
@@ -290,7 +319,7 @@ func toChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChu
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
-			Index: 0,
+			Index: r.Index,
 			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
@@ -407,6 +436,10 @@ func toModel(r api.ShowResponse, m string) Model {
 
 func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	var messages []api.Message
+	samples := r.N
+	if samples <= 0 {
+		samples = 1
+	}
 	for _, msg := range r.Messages {
 		toolName := ""
 		if strings.ToLower(msg.Role) == "tool" {
@@ -579,6 +612,7 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		Tools:           r.Tools,
 		Think:           think,
 		DebugRenderOnly: r.DebugRenderOnly,
+		Samples:         samples,
 	}, nil
 }
 
@@ -666,10 +700,14 @@ type BaseWriter struct {
 }
 
 type ChatWriter struct {
-	stream        bool
-	streamOptions *StreamOptions
-	id            string
-	toolCallSent  bool
+	stream          bool
+	streamOptions   *StreamOptions
+	id              string
+	expectedChoices int
+	toolCallSent    map[int]bool
+	completed       map[int]bool
+	usageResponses  map[int]api.ChatResponse
+	doneSent        bool
 	BaseWriter
 }
 
@@ -711,56 +749,95 @@ func (w *BaseWriter) writeError(data []byte) (int, error) {
 }
 
 func (w *ChatWriter) writeResponse(data []byte) (int, error) {
-	var chatResponse api.ChatResponse
-	err := json.Unmarshal(data, &chatResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// chat chunk
 	if w.stream {
-		c := toChunk(w.id, chatResponse, w.toolCallSent)
-		d, err := json.Marshal(c)
+		var chatResponse api.ChatResponse
+		if err := json.Unmarshal(data, &chatResponse); err != nil {
+			return 0, err
+		}
+
+		chunk := toChunk(w.id, chatResponse, w.toolCallSent[chatResponse.Index])
+		if len(chunk.Choices) > 0 {
+			idx := chunk.Choices[0].Index
+			if len(chunk.Choices[0].Delta.ToolCalls) > 0 {
+				w.toolCallSent[idx] = true
+			}
+		}
+
+		payload, err := json.Marshal(chunk)
 		if err != nil {
 			return 0, err
 		}
-		if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
-			w.toolCallSent = true
-		}
 
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-		if err != nil {
+		if _, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", payload))); err != nil {
 			return 0, err
 		}
 
 		if chatResponse.Done {
-			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
-				u := toUsage(chatResponse)
-				c.Usage = &u
-				c.Choices = []ChunkChoice{}
-				d, err := json.Marshal(c)
-				if err != nil {
-					return 0, err
-				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-				if err != nil {
-					return 0, err
-				}
+			idx := chatResponse.Index
+			if w.completed == nil {
+				w.completed = make(map[int]bool)
 			}
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
-			if err != nil {
-				return 0, err
+			if w.usageResponses == nil {
+				w.usageResponses = make(map[int]api.ChatResponse)
+			}
+			if _, ok := w.completed[idx]; !ok {
+				w.completed[idx] = true
+				w.usageResponses[idx] = chatResponse
+			}
+
+			if w.expectedChoices <= 0 {
+				w.expectedChoices = 1
+			}
+
+			if len(w.completed) == w.expectedChoices && !w.doneSent {
+				if w.streamOptions != nil && w.streamOptions.IncludeUsage {
+					responses := make([]api.ChatResponse, 0, len(w.usageResponses))
+					for _, r := range w.usageResponses {
+						responses = append(responses, r)
+					}
+					usage := toUsage(responses)
+					usageChunk := ChatCompletionChunk{
+						Id:                w.id,
+						Object:            "chat.completion.chunk",
+						Created:           time.Now().Unix(),
+						Model:             chatResponse.Model,
+						SystemFingerprint: "fp_ollama",
+						Choices:           []ChunkChoice{},
+						Usage:             &usage,
+					}
+					usagePayload, err := json.Marshal(usageChunk)
+					if err != nil {
+						return 0, err
+					}
+					if _, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", usagePayload))); err != nil {
+						return 0, err
+					}
+				}
+				if _, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n")); err != nil {
+					return 0, err
+				}
+				w.doneSent = true
 			}
 		}
 
 		return len(data), nil
 	}
 
-	// chat completion
+	var multi api.MultiChatResponse
+	var responses []api.ChatResponse
+	if err := json.Unmarshal(data, &multi); err == nil && multi.Responses != nil {
+		responses = multi.Responses
+	} else {
+		var chatResponse api.ChatResponse
+		if err := json.Unmarshal(data, &chatResponse); err != nil {
+			return 0, err
+		}
+		responses = []api.ChatResponse{chatResponse}
+	}
+
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toChatCompletion(w.id, chatResponse))
-	if err != nil {
+	if err := json.NewEncoder(w.ResponseWriter).Encode(toChatCompletion(w.id, responses)); err != nil {
 		return 0, err
 	}
 
@@ -1045,6 +1122,11 @@ func ChatMiddleware() gin.HandlerFunc {
 
 		var b bytes.Buffer
 
+		sampleCount := req.N
+		if sampleCount <= 0 {
+			sampleCount = 1
+		}
+
 		chatReq, err := fromChatRequest(req)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
@@ -1059,10 +1141,14 @@ func ChatMiddleware() gin.HandlerFunc {
 		c.Request.Body = io.NopCloser(&b)
 
 		w := &ChatWriter{
-			BaseWriter:    BaseWriter{ResponseWriter: c.Writer},
-			stream:        req.Stream,
-			id:            fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
-			streamOptions: req.StreamOptions,
+			BaseWriter:      BaseWriter{ResponseWriter: c.Writer},
+			stream:          req.Stream,
+			id:              fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
+			streamOptions:   req.StreamOptions,
+			expectedChoices: sampleCount,
+			toolCallSent:    make(map[int]bool),
+			completed:       make(map[int]bool),
+			usageResponses:  make(map[int]api.ChatResponse),
 		}
 
 		c.Writer = w
